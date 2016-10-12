@@ -267,6 +267,14 @@ static struct sock_fprog* mkFilter(struct Allocator* alloc, struct Except* eh)
             IFEQ(__NR_time, success),
         #endif
 
+        // NetPlatform_linux.c send recv
+        #ifdef __NR_send
+            IFEQ(__NR_send, success),
+        #endif
+        #ifdef __NR_recv
+            IFEQ(__NR_recv, success),
+        #endif
+
         // malloc()
         IFEQ(__NR_brk, success),
 
@@ -313,7 +321,10 @@ static struct sock_fprog* mkFilter(struct Allocator* alloc, struct Except* eh)
         // socketForIfName()
         // and ETHInterface_listDevices
         #ifdef __NR_socket
-            IFEQ(__NR_socket, socket),
+            IFEQ(__NR_socket, success),
+        #endif
+        #ifdef __NR_bind
+            IFEQ(__NR_bind, success),
         #endif
         IFEQ(__NR_ioctl, ioctl_setip),
 

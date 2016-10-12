@@ -23,7 +23,12 @@
 #include "crypto/AddressCalc.h"
 #include "crypto/random/Random.h"
 #include "crypto/random/libuv/LibuvEntropyProvider.h"
+#ifdef SUBNODE
+#include "subnode/SubnodePathfinder.h"
+#include "subnode/SupernodeHunter_admin.h"
+#else
 #include "dht/Pathfinder.h"
+#endif
 #include "exception/Jmp.h"
 #include "interface/Iface.h"
 #include "util/events/UDPAddrIface.h"
@@ -41,6 +46,11 @@
 #include "memory/MallocAllocator.h"
 #include "memory/Allocator_admin.h"
 #include "net/SwitchPinger_admin.h"
+#include "net/UpperDistributor_admin.h"
+
+#define NumberCompress_OLD_CODE
+#include "switch/NumberCompress.h"
+
 #include "tunnel/IpTunnel_admin.h"
 #include "tunnel/RouteGen_admin.h"
 #include "util/events/EventBase.h"
@@ -65,6 +75,11 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#include <dirent.h>
+#include <sys/types.h>
+#include <errno.h>
+#include <string.h>
+
 // Failsafe: abort if more than 2^23 bytes are allocated (8MB)
 #define ALLOCATOR_FAILSAFE (1<<23)
 
@@ -88,15 +103,19 @@
 
 static void adminPing(Dict* input, void* vadmin, String* txid, struct Allocator* requestAlloc)
 {
-    Dict d = Dict_CONST(String_CONST("q"), String_OBJ(String_CONST("pong")), NULL);
-    Admin_sendMessage(&d, txid, (struct Admin*) vadmin);
+    Dict* d = Dict_new(requestAlloc);
+    Dict_putStringCC(d, "error", "none", requestAlloc);
+    Dict_putStringCC(d, "q", "pong", requestAlloc);
+    Admin_sendMessage(d, txid, (struct Admin*) vadmin);
 }
 
 static void adminPid(Dict* input, void* vadmin, String* txid, struct Allocator* requestAlloc)
 {
     int pid = getpid();
-    Dict d = Dict_CONST(String_CONST("pid"), Int_OBJ(pid), NULL);
-    Admin_sendMessage(&d, txid, (struct Admin*) vadmin);
+    Dict* d = Dict_new(requestAlloc);
+    Dict_putStringCC(d, "error", "none", requestAlloc);
+    Dict_putIntC(d, "pid", pid, requestAlloc);
+    Admin_sendMessage(d, txid, (struct Admin*) vadmin);
 }
 
 struct Context
@@ -107,6 +126,7 @@ struct Context
     struct EventBase* base;
     struct NetCore* nc;
     struct IpTunnel* ipTunnel;
+    struct EncodingScheme* encodingScheme;
     Identity
 };
 
@@ -168,8 +188,10 @@ static void initTunfd(Dict* args, void* vcontext, String* txid, struct Allocator
     Jmp_try(jmp) {
         int64_t* tunfd = Dict_getInt(args, String_CONST("tunfd"));
         int64_t* tuntype = Dict_getInt(args, String_CONST("type"));
+        Log_info(ctx->logger, "Got initTunFd() request [%d] [%d]", (int)*tunfd, (int)*tuntype);
         if (!tunfd || *tunfd < 0) {
-            String* error = String_printf(requestAlloc, "Invalid tunfd");
+            Log_warn(ctx->logger, "Invalid tunfd [%d]", (int)*tunfd);
+            String* error = String_printf(requestAlloc, "Invalid tunfd [%d]", tunfd);
             sendResponse(error, ctx->admin, txid, requestAlloc);
             return;
         }
@@ -178,14 +200,33 @@ static void initTunfd(Dict* args, void* vcontext, String* txid, struct Allocator
         struct Pipe* p = Pipe_forFiles(fileno, fileno, ctx->base, &jmp.handler, ctx->alloc);
         p->logger = ctx->logger;
         if (type == FileNo_Type_ANDROID) {
+            Log_info(ctx->logger, "Plumbing AndroidWrapper iface in initTunFd() request [%d] [%d]",
+                     (int)*tunfd, (int)*tuntype);
             struct AndroidWrapper* aw = AndroidWrapper_new(ctx->alloc, ctx->logger);
             Iface_plumb(&aw->externalIf, &p->iface);
             Iface_plumb(&aw->internalIf, &ctx->nc->tunAdapt->tunIf);
         } else {
+            Log_info(ctx->logger, "Plumbing iface in initTunFd() request [%d] [%d]",
+                     (int)*tunfd, (int)*tuntype);
             Iface_plumb(&p->iface, &ctx->nc->tunAdapt->tunIf);
         }
+        Log_info(ctx->logger, "Finished initTunFd() request [%d] [%d]", (int)*tunfd, (int)*tuntype);
+
+        String* path = String_printf(ctx->alloc, "/proc/%d/fd", getpid());
+        DIR* dir = opendir(path->bytes);
+        if (!dir) {
+            Log_warn(ctx->logger, "Unable to opendir() [%s] [%s]", path->bytes, strerror(errno));
+        } else {
+            struct dirent* ent;
+            while ((ent = readdir(dir))) {
+                Log_debug(ctx->logger, "[type=%d] %s/%s", ent->d_type, path->bytes, ent->d_name);
+            }
+            closedir(dir);
+        }
+
         sendResponse(String_CONST("none"), ctx->admin, txid, requestAlloc);
     } Jmp_catch {
+        Log_warn(ctx->logger, "Failed to configure tunnel [%s]", jmp.message);
         String* error = String_printf(requestAlloc, "Failed to configure tunnel [%s]", jmp.message);
         sendResponse(error, ctx->admin, txid, requestAlloc);
         return;
@@ -207,6 +248,22 @@ static void initTunnel(Dict* args, void* vcontext, String* txid, struct Allocato
     }
 
     sendResponse(String_CONST("none"), ctx->admin, txid, requestAlloc);
+}
+
+static void nodeInfo(Dict* args, void* vcontext, String* txid, struct Allocator* requestAlloc)
+{
+    struct Context* const ctx = Identity_check((struct Context*) vcontext);
+    String* myAddr = Address_toString(ctx->nc->myAddress, requestAlloc);
+    String* schemeStr = EncodingScheme_serialize(ctx->encodingScheme, requestAlloc);
+    List* schemeList = EncodingScheme_asList(ctx->encodingScheme, requestAlloc);
+    Dict* out = Dict_new(requestAlloc);
+    Dict_putStringC(out, "myAddr", myAddr, requestAlloc);
+    char* schemeHex = Hex_print(schemeStr->bytes, schemeStr->len, requestAlloc);
+    Dict_putStringCC(out, "compressedSchemeHex", schemeHex, requestAlloc);
+    Dict_putListC(out, "encodingScheme", schemeList, requestAlloc);
+    Dict_putIntC(out, "version", Version_CURRENT_PROTOCOL, requestAlloc);
+    Dict_putStringCC(out, "error", "none", requestAlloc);
+    Admin_sendMessage(out, txid, ctx->admin);
 }
 
 void Core_init(struct Allocator* alloc,
@@ -231,13 +288,24 @@ void Core_init(struct Allocator* alloc,
     Iface_plumb(&nc->tunAdapt->ipTunnelIf, &ipTunnel->tunInterface);
     Iface_plumb(&nc->upper->ipTunnelIf, &ipTunnel->nodeInterface);
 
+    struct EncodingScheme* encodingScheme = NumberCompress_defineScheme(alloc);
+
     // The link between the Pathfinder and the core needs to be asynchronous.
-    struct Pathfinder* pf = Pathfinder_register(alloc, logger, eventBase, rand, admin);
+    #ifdef SUBNODE
+        struct SubnodePathfinder* pf = SubnodePathfinder_new(
+            alloc, logger, eventBase, rand, nc->myAddress, privateKey, encodingScheme);
+    #else
+        struct Pathfinder* pf = Pathfinder_register(alloc, logger, eventBase, rand, admin);
+    #endif
     struct ASynchronizer* pfAsync = ASynchronizer_new(alloc, eventBase, logger);
     Iface_plumb(&pfAsync->ifA, &pf->eventIf);
     EventEmitter_regPathfinderIface(nc->ee, &pfAsync->ifB);
+    #ifdef SUBNODE
+        SubnodePathfinder_start(pf);
+    #endif
 
     // ------------------- Register RPC functions ----------------------- //
+    UpperDistributor_admin_register(nc->upper, admin, alloc);
     RouteGen_admin_register(rg, admin, alloc);
     InterfaceController_admin_register(nc->ifController, admin, alloc);
     SwitchPinger_admin_register(nc->sp, admin, alloc);
@@ -246,6 +314,10 @@ void Core_init(struct Allocator* alloc,
     ETHInterface_admin_register(eventBase, alloc, logger, admin, nc->ifController);
 #endif
     FileNo_admin_register(admin, alloc, eventBase, logger, eh);
+
+#ifdef SUBNODE
+    SupernodeHunter_admin_register(pf->snh, admin, alloc);
+#endif
 
     AuthorizedPasswords_init(admin, nc->ca, alloc);
     Admin_registerFunction("ping", adminPing, admin, false, NULL, admin);
@@ -264,6 +336,7 @@ void Core_init(struct Allocator* alloc,
     ctx->base = eventBase;
     ctx->ipTunnel = ipTunnel;
     ctx->nc = nc;
+    ctx->encodingScheme = encodingScheme;
 
     Admin_registerFunction("Core_exit", adminExit, ctx, true, NULL, admin);
 
@@ -279,6 +352,8 @@ void Core_init(struct Allocator* alloc,
             { .name = "tunfd", .required = 1, .type = "Int" },
             { .name = "type", .required = 0, .type = "Int" }
         }), admin);
+
+    Admin_registerFunction("Core_nodeInfo", nodeInfo, ctx, false, NULL, admin);
 }
 
 int Core_main(int argc, char** argv)
